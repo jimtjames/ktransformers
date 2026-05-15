@@ -321,70 +321,109 @@ struct GemmKernel224FP8 {
   using BufferB = BufferBFP8Impl<GemmKernel224FP8>;
   using BufferC = BufferCFP32ReduceImpl<GemmKernel224FP8>;
 
-  static inline std::pair<__m512i, __m512i> fp8x64_to_bf16x64(__m512i bfp8_512) {
-    // fp8->bf16
-    __m512i b_hi = _mm512_permutex2var_epi8(bf16_hi_0_mask(), bfp8_512, bf16_hi_1_mask());
-    __m512i b_lo = _mm512_permutex2var_epi8(bf16_lo_0_mask(), bfp8_512, bf16_lo_1_mask());
-    b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask(), bfp8_512), b_hi);
-    __m512i bbf16_0 = _mm512_unpacklo_epi8(b_lo, b_hi);
-    __m512i bbf16_1 = _mm512_unpackhi_epi8(b_lo, b_hi);
-    return {bbf16_0, bbf16_1};
+  __attribute__((always_inline)) static inline __m512i fp8_to_fp32_math(__m512i x32) {
+    __m512i x32_abs = _mm512_and_si512(x32, _mm512_set1_epi32(0x7F));
+    __m512i normal_val = _mm512_add_epi32(_mm512_slli_epi32(x32_abs, 20), _mm512_set1_epi32(0x3c000000));
+    __m512i subnormal_table = _mm512_setr_epi32(0x00000000, 0x3b000000, 0x3b800000, 0x3bc00000, 0x3c000000, 0x3c200000,
+                                                0x3c400000, 0x3c600000, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m512i subnormal_val = _mm512_permutexvar_epi32(x32_abs, subnormal_table);
+    __mmask16 is_subnormal = _mm512_cmpgt_epi32_mask(_mm512_set1_epi32(8), x32_abs);
+    __m512i abs_val = _mm512_mask_blend_epi32(is_subnormal, normal_val, subnormal_val);
+    __m512i sign = _mm512_slli_epi32(_mm512_and_si512(x32, _mm512_set1_epi32(0x80)), 24);
+    return _mm512_or_si512(abs_val, sign);
   }
+
+  struct ActivationBF16 {
+    __m512bh a;
+#if !defined(__AVX512BF16__)
+    __m512 a_even;
+    __m512 a_odd;
+#endif
+
+    __attribute__((always_inline)) ActivationBF16(__m512bh a_) : a(a_) {
+#if !defined(__AVX512BF16__)
+      a_even = _mm512_castsi512_ps(_mm512_slli_epi32((__m512i)a_, 16));
+      a_odd = _mm512_castsi512_ps(_mm512_and_si512((__m512i)a_, _mm512_set1_epi32(0xFFFF0000)));
+#endif
+    }
+  };
+
+  struct DequantizedWeight {
+#if defined(__AVX512BF16__)
+    __m512bh d_lo;
+    __m512bh d_hi;
+#else
+    __m512 w_lo_even;
+    __m512 w_lo_odd;
+    __m512 w_hi_even;
+    __m512 w_hi_odd;
+#endif
+
+    __attribute__((always_inline)) DequantizedWeight(__m512i bfp8_512) {
+#if defined(__AVX512BF16__)
+      __m512i b_hi = _mm512_permutex2var_epi8(bf16_hi_0_mask(), bfp8_512, bf16_hi_1_mask());
+      __m512i b_lo = _mm512_permutex2var_epi8(bf16_lo_0_mask(), bfp8_512, bf16_lo_1_mask());
+      b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask(), bfp8_512), b_hi);
+      d_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
+      d_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
+#else
+      __m512i even_bytes = _mm512_and_si512(bfp8_512, _mm512_set1_epi16(0x00FF));
+      __m512i odd_bytes = _mm512_srli_epi16(bfp8_512, 8);
+
+      __m512i lo_even_idx = _mm512_unpacklo_epi16(even_bytes, _mm512_setzero_si512());
+      __m512i hi_even_idx = _mm512_unpackhi_epi16(even_bytes, _mm512_setzero_si512());
+      __m512i lo_odd_idx = _mm512_unpacklo_epi16(odd_bytes, _mm512_setzero_si512());
+      __m512i hi_odd_idx = _mm512_unpackhi_epi16(odd_bytes, _mm512_setzero_si512());
+
+      w_lo_even = _mm512_castsi512_ps(fp8_to_fp32_math(lo_even_idx));
+      w_hi_even = _mm512_castsi512_ps(fp8_to_fp32_math(hi_even_idx));
+      w_lo_odd = _mm512_castsi512_ps(fp8_to_fp32_math(lo_odd_idx));
+      w_hi_odd = _mm512_castsi512_ps(fp8_to_fp32_math(hi_odd_idx));
+#endif
+    }
+  };
+
+  __attribute__((always_inline)) static inline void fp8_dot_bf16(__m512& acc_lo, __m512& acc_hi,
+                                                                 const DequantizedWeight& w,
+                                                                 const ActivationBF16& act) {
+#if defined(__AVX512BF16__)
+    acc_lo = _mm512_dpbf16_ps(acc_lo, act.a, w.d_lo);
+    acc_hi = _mm512_dpbf16_ps(acc_hi, act.a, w.d_hi);
+#else
+    acc_lo = _mm512_fmadd_ps(act.a_even, w.w_lo_even, acc_lo);
+    acc_lo = _mm512_fmadd_ps(act.a_odd, w.w_lo_odd, acc_lo);
+    acc_hi = _mm512_fmadd_ps(act.a_even, w.w_hi_even, acc_hi);
+    acc_hi = _mm512_fmadd_ps(act.a_odd, w.w_hi_odd, acc_hi);
+#endif
+  }
+
   // Optimized AVX kernel: process entire k_group_size
   // Load all data first, then convert all, then compute all
   // This gives compiler more freedom to schedule instructions
   static void avx_kernel(int m, int n, int k, int m_begin, int n_begin, int k_group_begin, float* c, BufferA* ba,
                          BufferB* bb, int k_group_size) {
-    const __m512i bf16_hi_0_val = bf16_hi_0_mask();
-    const __m512i bf16_hi_1_val = bf16_hi_1_mask();
-    const __m512i bf16_lo_0_val = bf16_lo_0_mask();
-    const __m512i bf16_lo_1_val = bf16_lo_1_mask();
-    const __m512i sign_mask_val = sign_mask();
-
     __m512* c512 = (__m512*)c;
     int m_block_end = std::min(m - m_begin, M_STEP);
 
-    // Zero out accumulator at the start
     for (int m_i = 0; m_i < m_block_end; m_i++) {
       c512[m_i * 2] = _mm512_setzero_ps();
       c512[m_i * 2 + 1] = _mm512_setzero_ps();
     }
 
-    // Process entire k_group_size
     for (int k_begin = 0; k_begin < k_group_size && k_group_begin + k_begin < k; k_begin += K_STEP) {
       ggml_bf16_t* abf16 = (ggml_bf16_t*)ba->get_submat(m, k, m_begin, k_group_begin + k_begin);
       __m512i* bfp8_512 = (__m512i*)bb->get_submat(n, k, n_begin, k_group_begin + k_begin);
 
       for (int m_i = 0; m_i < m_block_end; m_i++) {
-        // Process 2 k_i per iteration
         for (int k_i = 0; k_i < 16; k_i += 2) {
-          // Load A vectors
-          __m512bh ma0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]);
-          __m512bh ma1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]);
+          ActivationBF16 a0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]));
+          ActivationBF16 a1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]));
 
-          // Load B matrices
-          __m512i bfp8_0 = bfp8_512[k_i];
-          __m512i bfp8_1 = bfp8_512[k_i + 1];
+          DequantizedWeight d0(bfp8_512[k_i]);
+          DequantizedWeight d1(bfp8_512[k_i + 1]);
 
-          // Convert FP8 -> BF16 for all
-          __m512i b_hi_0 = _mm512_permutex2var_epi8(bf16_hi_0_val, bfp8_0, bf16_hi_1_val);
-          __m512i b_lo_0 = _mm512_permutex2var_epi8(bf16_lo_0_val, bfp8_0, bf16_lo_1_val);
-          b_hi_0 = _mm512_or_si512(_mm512_and_si512(sign_mask_val, bfp8_0), b_hi_0);
-
-          __m512i b_hi_1 = _mm512_permutex2var_epi8(bf16_hi_0_val, bfp8_1, bf16_hi_1_val);
-          __m512i b_lo_1 = _mm512_permutex2var_epi8(bf16_lo_0_val, bfp8_1, bf16_lo_1_val);
-          b_hi_1 = _mm512_or_si512(_mm512_and_si512(sign_mask_val, bfp8_1), b_hi_1);
-
-          // Compute dpbf16 for all
-          __m512bh bbf16_0_0 = (__m512bh)_mm512_unpacklo_epi8(b_lo_0, b_hi_0);
-          __m512bh bbf16_1_0 = (__m512bh)_mm512_unpackhi_epi8(b_lo_0, b_hi_0);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma0, bbf16_0_0);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma0, bbf16_1_0);
-
-          __m512bh bbf16_0_1 = (__m512bh)_mm512_unpacklo_epi8(b_lo_1, b_hi_1);
-          __m512bh bbf16_1_1 = (__m512bh)_mm512_unpackhi_epi8(b_lo_1, b_hi_1);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma1, bbf16_0_1);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma1, bbf16_1_1);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d0, a0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d1, a1);
         }
       }
     }
@@ -392,110 +431,60 @@ struct GemmKernel224FP8 {
 
   // Optimized AVX kernel: process 4 k_i at once, convert B once and reuse for all m rows
   // This version achieved ~493 GB/s - restoring as baseline for further optimization
-  static void avx_kernel_4(int m, int n, int k, int m_begin, int n_begin, int k_group_begin, float* c, BufferA* ba,
-                           BufferB* bb, int k_group_size) {
-    const __m512i bf16_hi_0 = bf16_hi_0_mask();
-    const __m512i bf16_hi_1 = bf16_hi_1_mask();
-    const __m512i bf16_lo_0 = bf16_lo_0_mask();
-    const __m512i bf16_lo_1 = bf16_lo_1_mask();
-    const __m512i sign_mask_v = sign_mask();
 
+  static void avx_kernel_4(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
+                           BufferB* bb, int k_group_size) {
     __m512* c512 = (__m512*)c;
     int m_block_end = std::min(m - m_begin, M_STEP);
 
-    // Zero out accumulator
-    for (int m_i = 0; m_i < m_block_end; m_i++) {
-      c512[m_i * 2] = _mm512_setzero_ps();
-      c512[m_i * 2 + 1] = _mm512_setzero_ps();
+    if (k_block_begin == 0) {
+      for (int m_i = 0; m_i < m_block_end; m_i++) {
+        c512[m_i * 2] = _mm512_setzero_ps();
+        c512[m_i * 2 + 1] = _mm512_setzero_ps();
+      }
     }
 
-    // Process entire k_group_size
-    for (int k_begin = 0; k_begin < k_group_size && k_group_begin + k_begin < k; k_begin += K_STEP) {
-      ggml_bf16_t* abf16 = (ggml_bf16_t*)ba->get_submat(m, k, m_begin, k_group_begin + k_begin);
-      __m512i* bfp8_512 = (__m512i*)bb->get_submat(n, k, n_begin, k_group_begin + k_begin);
+    for (int k_begin = 0; k_begin < K_BLOCK && k_block_begin + k_begin < k; k_begin += K_STEP) {
+      ggml_bf16_t* abf16 = (ggml_bf16_t*)ba->get_submat(m, k, m_begin, k_block_begin + k_begin);
+      __m512i* bfp8_512 = (__m512i*)bb->get_submat(n, k, n_begin, k_block_begin + k_begin);
 
-      // Process 4 k_i at once - convert B and reuse across all m rows
       for (int k_i = 0; k_i < 16; k_i += 4) {
-        // Load 4 B vectors
-        __m512i bfp8_0 = bfp8_512[k_i];
-        __m512i bfp8_1 = bfp8_512[k_i + 1];
-        __m512i bfp8_2 = bfp8_512[k_i + 2];
-        __m512i bfp8_3 = bfp8_512[k_i + 3];
+        DequantizedWeight d0(bfp8_512[k_i]);
+        DequantizedWeight d1(bfp8_512[k_i + 1]);
+        DequantizedWeight d2(bfp8_512[k_i + 2]);
+        DequantizedWeight d3(bfp8_512[k_i + 3]);
 
-        // Convert all 4 FP8 -> BF16
-        __m512i b_hi, b_lo;
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_0),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_0, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_0, bf16_lo_1);
-        __m512bh bbf16_0_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_0_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_1),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_1, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_1, bf16_lo_1);
-        __m512bh bbf16_1_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_1_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_2),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_2, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_2, bf16_lo_1);
-        __m512bh bbf16_2_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_2_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_3),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_3, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_3, bf16_lo_1);
-        __m512bh bbf16_3_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_3_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        // Process m rows - unroll by 2 for better ILP
         int m_i = 0;
         for (; m_i + 1 < m_block_end; m_i += 2) {
-          // Load A values for 2 rows
-          __m512bh ma0_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]);
-          __m512bh ma1_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]);
-          __m512bh ma2_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]);
-          __m512bh ma3_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]);
-          __m512bh ma0_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + k_i * 2]);
-          __m512bh ma1_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 1) * 2]);
-          __m512bh ma2_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 2) * 2]);
-          __m512bh ma3_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 3) * 2]);
+          ActivationBF16 a0_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]));
+          ActivationBF16 a1_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]));
+          ActivationBF16 a2_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]));
+          ActivationBF16 a3_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]));
+          ActivationBF16 a0_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + k_i * 2]));
+          ActivationBF16 a1_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 1) * 2]));
+          ActivationBF16 a2_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 2) * 2]));
+          ActivationBF16 a3_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 3) * 2]));
 
-          // Process row 0, then row 1 - sequential to avoid dependencies
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma0_0, bbf16_0_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma0_0, bbf16_0_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma1_0, bbf16_1_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma1_0, bbf16_1_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma2_0, bbf16_2_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma2_0, bbf16_2_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma3_0, bbf16_3_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma3_0, bbf16_3_hi);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d0, a0_0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d1, a1_0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d2, a2_0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d3, a3_0);
 
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma0_1, bbf16_0_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma0_1, bbf16_0_hi);
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma1_1, bbf16_1_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma1_1, bbf16_1_hi);
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma2_1, bbf16_2_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma2_1, bbf16_2_hi);
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma3_1, bbf16_3_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma3_1, bbf16_3_hi);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d0, a0_1);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d1, a1_1);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d2, a2_1);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d3, a3_1);
         }
-        // Handle remaining row
         for (; m_i < m_block_end; m_i++) {
-          __m512bh ma0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]);
-          __m512bh ma1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]);
-          __m512bh ma2 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]);
-          __m512bh ma3 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]);
+          ActivationBF16 a0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]));
+          ActivationBF16 a1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]));
+          ActivationBF16 a2((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]));
+          ActivationBF16 a3((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]));
 
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma0, bbf16_0_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma0, bbf16_0_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma1, bbf16_1_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma1, bbf16_1_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma2, bbf16_2_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma2, bbf16_2_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma3, bbf16_3_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma3, bbf16_3_hi);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d0, a0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d1, a1);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d2, a2);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d3, a3);
         }
       }
     }
@@ -662,8 +651,80 @@ struct GemmKernel224FP8PerChannel {
   using BufferC = BufferCFP32Impl<GemmKernel224FP8PerChannel>;
 
   // Reuse FP8->BF16 conversion from GemmKernel224FP8
-  static inline std::pair<__m512i, __m512i> fp8x64_to_bf16x64(__m512i bfp8_512) {
-    return GemmKernel224FP8::fp8x64_to_bf16x64(bfp8_512);
+  __attribute__((always_inline)) static inline __m512i fp8_to_fp32_math(__m512i x32) {
+    __m512i x32_abs = _mm512_and_si512(x32, _mm512_set1_epi32(0x7F));
+    __m512i normal_val = _mm512_add_epi32(_mm512_slli_epi32(x32_abs, 20), _mm512_set1_epi32(0x3c000000));
+    __m512i subnormal_table = _mm512_setr_epi32(0x00000000, 0x3b000000, 0x3b800000, 0x3bc00000, 0x3c000000, 0x3c200000,
+                                                0x3c400000, 0x3c600000, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m512i subnormal_val = _mm512_permutexvar_epi32(x32_abs, subnormal_table);
+    __mmask16 is_subnormal = _mm512_cmpgt_epi32_mask(_mm512_set1_epi32(8), x32_abs);
+    __m512i abs_val = _mm512_mask_blend_epi32(is_subnormal, normal_val, subnormal_val);
+    __m512i sign = _mm512_slli_epi32(_mm512_and_si512(x32, _mm512_set1_epi32(0x80)), 24);
+    return _mm512_or_si512(abs_val, sign);
+  }
+
+  struct ActivationBF16 {
+    __m512bh a;
+#if !defined(__AVX512BF16__)
+    __m512 a_even;
+    __m512 a_odd;
+#endif
+
+    __attribute__((always_inline)) ActivationBF16(__m512bh a_) : a(a_) {
+#if !defined(__AVX512BF16__)
+      a_even = _mm512_castsi512_ps(_mm512_slli_epi32((__m512i)a_, 16));
+      a_odd = _mm512_castsi512_ps(_mm512_and_si512((__m512i)a_, _mm512_set1_epi32(0xFFFF0000)));
+#endif
+    }
+  };
+
+  struct DequantizedWeight {
+#if defined(__AVX512BF16__)
+    __m512bh d_lo;
+    __m512bh d_hi;
+#else
+    __m512 w_lo_even;
+    __m512 w_lo_odd;
+    __m512 w_hi_even;
+    __m512 w_hi_odd;
+#endif
+
+    __attribute__((always_inline)) DequantizedWeight(__m512i bfp8_512) {
+#if defined(__AVX512BF16__)
+      __m512i b_hi = _mm512_permutex2var_epi8(bf16_hi_0_mask(), bfp8_512, bf16_hi_1_mask());
+      __m512i b_lo = _mm512_permutex2var_epi8(bf16_lo_0_mask(), bfp8_512, bf16_lo_1_mask());
+      b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask(), bfp8_512), b_hi);
+      d_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
+      d_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
+#else
+      __m512i even_bytes = _mm512_and_si512(bfp8_512, _mm512_set1_epi16(0x00FF));
+      __m512i odd_bytes = _mm512_srli_epi16(bfp8_512, 8);
+
+      __m512i lo_even_idx = _mm512_unpacklo_epi16(even_bytes, _mm512_setzero_si512());
+      __m512i hi_even_idx = _mm512_unpackhi_epi16(even_bytes, _mm512_setzero_si512());
+      __m512i lo_odd_idx = _mm512_unpacklo_epi16(odd_bytes, _mm512_setzero_si512());
+      __m512i hi_odd_idx = _mm512_unpackhi_epi16(odd_bytes, _mm512_setzero_si512());
+
+      w_lo_even = _mm512_castsi512_ps(fp8_to_fp32_math(lo_even_idx));
+      w_hi_even = _mm512_castsi512_ps(fp8_to_fp32_math(hi_even_idx));
+      w_lo_odd = _mm512_castsi512_ps(fp8_to_fp32_math(lo_odd_idx));
+      w_hi_odd = _mm512_castsi512_ps(fp8_to_fp32_math(hi_odd_idx));
+#endif
+    }
+  };
+
+  __attribute__((always_inline)) static inline void fp8_dot_bf16(__m512& acc_lo, __m512& acc_hi,
+                                                                 const DequantizedWeight& w,
+                                                                 const ActivationBF16& act) {
+#if defined(__AVX512BF16__)
+    acc_lo = _mm512_dpbf16_ps(acc_lo, act.a, w.d_lo);
+    acc_hi = _mm512_dpbf16_ps(acc_hi, act.a, w.d_hi);
+#else
+    acc_lo = _mm512_fmadd_ps(act.a_even, w.w_lo_even, acc_lo);
+    acc_lo = _mm512_fmadd_ps(act.a_odd, w.w_lo_odd, acc_lo);
+    acc_hi = _mm512_fmadd_ps(act.a_even, w.w_hi_even, acc_hi);
+    acc_hi = _mm512_fmadd_ps(act.a_odd, w.w_hi_odd, acc_hi);
+#endif
   }
 
   /**
@@ -698,16 +759,9 @@ struct GemmKernel224FP8PerChannel {
   // AVX kernel for per-channel FP8 GEMM - processes entire K dimension
   static void avx_kernel_4(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
                            BufferB* bb) {
-    const __m512i bf16_hi_0 = GemmKernel224FP8::bf16_hi_0_mask();
-    const __m512i bf16_hi_1 = GemmKernel224FP8::bf16_hi_1_mask();
-    const __m512i bf16_lo_0 = GemmKernel224FP8::bf16_lo_0_mask();
-    const __m512i bf16_lo_1 = GemmKernel224FP8::bf16_lo_1_mask();
-    const __m512i sign_mask_v = GemmKernel224FP8::sign_mask();
-
     __m512* c512 = (__m512*)c;
     int m_block_end = std::min(m - m_begin, M_STEP);
 
-    // Zero out accumulator at start of K_BLOCK
     if (k_block_begin == 0) {
       for (int m_i = 0; m_i < m_block_end; m_i++) {
         c512[m_i * 2] = _mm512_setzero_ps();
@@ -715,91 +769,47 @@ struct GemmKernel224FP8PerChannel {
       }
     }
 
-    // Process K_BLOCK
     for (int k_begin = 0; k_begin < K_BLOCK && k_block_begin + k_begin < k; k_begin += K_STEP) {
       ggml_bf16_t* abf16 = (ggml_bf16_t*)ba->get_submat(m, k, m_begin, k_block_begin + k_begin);
       __m512i* bfp8_512 = (__m512i*)bb->get_submat(n, k, n_begin, k_block_begin + k_begin);
 
-      // Process 4 k_i at once
       for (int k_i = 0; k_i < 16; k_i += 4) {
-        // Load 4 B vectors
-        __m512i bfp8_0 = bfp8_512[k_i];
-        __m512i bfp8_1 = bfp8_512[k_i + 1];
-        __m512i bfp8_2 = bfp8_512[k_i + 2];
-        __m512i bfp8_3 = bfp8_512[k_i + 3];
+        DequantizedWeight d0(bfp8_512[k_i]);
+        DequantizedWeight d1(bfp8_512[k_i + 1]);
+        DequantizedWeight d2(bfp8_512[k_i + 2]);
+        DequantizedWeight d3(bfp8_512[k_i + 3]);
 
-        // Convert all 4 FP8 -> BF16
-        __m512i b_hi, b_lo;
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_0),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_0, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_0, bf16_lo_1);
-        __m512bh bbf16_0_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_0_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_1),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_1, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_1, bf16_lo_1);
-        __m512bh bbf16_1_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_1_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_2),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_2, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_2, bf16_lo_1);
-        __m512bh bbf16_2_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_2_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        b_hi = _mm512_or_si512(_mm512_and_si512(sign_mask_v, bfp8_3),
-                               _mm512_permutex2var_epi8(bf16_hi_0, bfp8_3, bf16_hi_1));
-        b_lo = _mm512_permutex2var_epi8(bf16_lo_0, bfp8_3, bf16_lo_1);
-        __m512bh bbf16_3_lo = (__m512bh)_mm512_unpacklo_epi8(b_lo, b_hi);
-        __m512bh bbf16_3_hi = (__m512bh)_mm512_unpackhi_epi8(b_lo, b_hi);
-
-        // Process m rows
         int m_i = 0;
         for (; m_i + 1 < m_block_end; m_i += 2) {
-          __m512bh ma0_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]);
-          __m512bh ma1_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]);
-          __m512bh ma2_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]);
-          __m512bh ma3_0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]);
-          __m512bh ma0_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + k_i * 2]);
-          __m512bh ma1_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 1) * 2]);
-          __m512bh ma2_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 2) * 2]);
-          __m512bh ma3_1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 3) * 2]);
+          ActivationBF16 a0_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]));
+          ActivationBF16 a1_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]));
+          ActivationBF16 a2_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]));
+          ActivationBF16 a3_0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]));
+          ActivationBF16 a0_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + k_i * 2]));
+          ActivationBF16 a1_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 1) * 2]));
+          ActivationBF16 a2_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 2) * 2]));
+          ActivationBF16 a3_1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[(m_i + 1) * K_STEP + (k_i + 3) * 2]));
 
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma0_0, bbf16_0_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma0_0, bbf16_0_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma1_0, bbf16_1_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma1_0, bbf16_1_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma2_0, bbf16_2_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma2_0, bbf16_2_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma3_0, bbf16_3_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma3_0, bbf16_3_hi);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d0, a0_0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d1, a1_0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d2, a2_0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d3, a3_0);
 
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma0_1, bbf16_0_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma0_1, bbf16_0_hi);
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma1_1, bbf16_1_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma1_1, bbf16_1_hi);
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma2_1, bbf16_2_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma2_1, bbf16_2_hi);
-          c512[(m_i + 1) * 2] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2], ma3_1, bbf16_3_lo);
-          c512[(m_i + 1) * 2 + 1] = _mm512_dpbf16_ps(c512[(m_i + 1) * 2 + 1], ma3_1, bbf16_3_hi);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d0, a0_1);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d1, a1_1);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d2, a2_1);
+          fp8_dot_bf16(c512[(m_i + 1) * 2], c512[(m_i + 1) * 2 + 1], d3, a3_1);
         }
-        // Handle remaining row
         for (; m_i < m_block_end; m_i++) {
-          __m512bh ma0 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]);
-          __m512bh ma1 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]);
-          __m512bh ma2 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]);
-          __m512bh ma3 = (__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]);
+          ActivationBF16 a0((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + k_i * 2]));
+          ActivationBF16 a1((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 1) * 2]));
+          ActivationBF16 a2((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 2) * 2]));
+          ActivationBF16 a3((__m512bh)_mm512_set1_epi32(*(int32_t*)&abf16[m_i * K_STEP + (k_i + 3) * 2]));
 
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma0, bbf16_0_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma0, bbf16_0_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma1, bbf16_1_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma1, bbf16_1_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma2, bbf16_2_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma2, bbf16_2_hi);
-          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma3, bbf16_3_lo);
-          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma3, bbf16_3_hi);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d0, a0);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d1, a1);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d2, a2);
+          fp8_dot_bf16(c512[m_i * 2], c512[m_i * 2 + 1], d3, a3);
         }
       }
     }
