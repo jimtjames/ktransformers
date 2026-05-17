@@ -208,8 +208,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  // mat-mat: 4×4 register tile (M_TILE=4, N_TILE=4 → 16 累加器)。
-  // 每 K-group 解码 4 行 N 一次, 被 4 个 token 共享 → PSHUFB 解码开销 / 4。
+  // mat-mat: 4×2 register tile (M_TILE=4, N_TILE=2 → 8 累加器, ≤ 32 ZMM 寄存器,
+  // 避免 Skylake-SP 寄存溢出)。每 K-group 解码 2 行 N, 被 4 个 token 共享。
   // M / N 尾巴回退到 mat-vec 单 token 内层 (V4 chunked-prefill 16/32/64 整数倍, 极少触发)。
   static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
@@ -217,7 +217,7 @@ struct GemmKernel224MXFP4SmallKGroup {
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
     constexpr int MB = 4;
-    constexpr int NB = 4;
+    constexpr int NB = 2;
 
     int m_pos = 0;
     for (; m_pos + MB <= m; m_pos += MB) {
@@ -232,35 +232,25 @@ struct GemmKernel224MXFP4SmallKGroup {
       for (; n_pos + NB <= n_end; n_pos += NB) {
         __m128i* w0 = (__m128i*)bb->get_submat(n, k, n_pos + 0, 0);
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
-        __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
-        __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
         const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
         const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
 
         __m512 acc[MB][NB];
         for (int i = 0; i < MB; i++)
           for (int j = 0; j < NB; j++) acc[i][j] = _mm512_setzero_ps();
 
         for (int g = 0; g < kg_count; g++) {
-          // 4 行权重解码一次, MB 个 token 共享
+          // 2 行权重解码一次, MB 个 token 共享
           const DequantizedWeight d0(w0[g]);
           const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
           const __m512 sv0 = _mm512_set1_ps(s0[g]);
           const __m512 sv1 = _mm512_set1_ps(s1[g]);
-          const __m512 sv2 = _mm512_set1_ps(s2[g]);
-          const __m512 sv3 = _mm512_set1_ps(s3[g]);
 
 #define V_FMA_ROW(M_I)                                                      \
   do {                                                                      \
     const ActivationBF16 a(a_rows[M_I][g]);                                 \
     acc[M_I][0] = _mm512_fmadd_ps(sv0, mxfp4_dot_bf16(d0, a), acc[M_I][0]); \
     acc[M_I][1] = _mm512_fmadd_ps(sv1, mxfp4_dot_bf16(d1, a), acc[M_I][1]); \
-    acc[M_I][2] = _mm512_fmadd_ps(sv2, mxfp4_dot_bf16(d2, a), acc[M_I][2]); \
-    acc[M_I][3] = _mm512_fmadd_ps(sv3, mxfp4_dot_bf16(d3, a), acc[M_I][3]); \
   } while (0)
           V_FMA_ROW(0);
           V_FMA_ROW(1);
@@ -270,10 +260,11 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
         for (int i = 0; i < MB; i++) {
           float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
-          reduce4(acc[i][0], acc[i][1], acc[i][2], acc[i][3], c_row + (n_pos - n_start));
+          c_row[n_pos - n_start + 0] = _mm512_reduce_add_ps(acc[i][0]);
+          c_row[n_pos - n_start + 1] = _mm512_reduce_add_ps(acc[i][1]);
         }
       }
-      // N 尾巴: 单 N 列 × MB token (V4 不触发)
+      // N 尾巴: 单 N 列 × MB token
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
         const float* s = bb->get_scale(n, n_pos, k, 0);
@@ -289,33 +280,26 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
       }
     }
-    // M 尾巴: M 不是 MB 倍数时余下 token, 退回单 token mat-vec 内层 (V4 不触发)
+    // M 尾巴: M 不是 MB 倍数时余下 token, 退回单 token mat-vec 内层
     for (int mi = m_pos; mi < m; mi++) {
       float* c_row = bc->get_submat(m, n, mi, n_start);
       __m512bh* a_row = (__m512bh*)ba->get_submat(m, k, mi, 0);
       int n_pos = n_start;
-      for (; n_pos + 4 <= n_end; n_pos += 4) {
+      for (; n_pos + 2 <= n_end; n_pos += 2) {
         __m128i* w0 = (__m128i*)bb->get_submat(n, k, n_pos + 0, 0);
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
-        __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
-        __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
         const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
         const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
-        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
           const DequantizedWeight d0(w0[g]);
           const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
           a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), a0);
           a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), a1);
-          a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), a2);
-          a3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]), mxfp4_dot_bf16(d3, a), a3);
         }
-        reduce4(a0, a1, a2, a3, c_row + (n_pos - n_start));
+        c_row[n_pos - n_start + 0] = _mm512_reduce_add_ps(a0);
+        c_row[n_pos - n_start + 1] = _mm512_reduce_add_ps(a1);
       }
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
