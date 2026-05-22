@@ -1075,7 +1075,7 @@ struct BufferBInt4WithZeroImpl {
 template <typename K>
 struct BufferBInt4KGroupImpl {
   using dt = typename K::dt;
-  dt* b;     // packed signed int4 weights, col majored
+  dt* b;     // packed FP4 weights, 4-row interleaved layout
   float* d;  // scales only (no mins/zero-points), row majored
   int n, k, k_group_size, k_group_count;
 
@@ -1102,33 +1102,71 @@ struct BufferBInt4KGroupImpl {
     d = reinterpret_cast<float*>(offset_pointer(b, n * k / 2));
   }
 
-  // Load from packed signed int4 format
-  // Input: proj is packed int4 weights (2 int4 values per byte)
-  // Each int4 value is in range [-8, 7] (signed)
+  // Load from packed FP4 format, interleaving rows in groups of 4.
+  // Layout: for each 4-row group [r..r+3], for each K-group g:
+  //   bytes g*64+0..15  = row r+0, K-group g  (16 bytes = 32 FP4 values)
+  //   bytes g*64+16..31 = row r+1, K-group g
+  //   bytes g*64+32..47 = row r+2, K-group g
+  //   bytes g*64+48..63 = row r+3, K-group g
   void from_raw_mat(uint8_t* proj, int ith, int nth) {
     auto [n_start, n_end] = K::split_range_n(n, ith, nth);
-    if (n_start >= n_end) {
-      return;
-    }
+    if (n_start >= n_end) return;
     const size_t row_bytes = static_cast<size_t>(k) / 2;
-    const size_t rows = static_cast<size_t>(n_end - n_start);
-    uint8_t* dst_weights = reinterpret_cast<uint8_t*>(b) + n_start * row_bytes;
-    const uint8_t* src_weights = proj + n_start * row_bytes;
-    std::memcpy(dst_weights, src_weights, rows * row_bytes);
+    const int kg_count = k / 32;
+    uint8_t* b_u8 = reinterpret_cast<uint8_t*>(b);
+    for (int nb = n_start; nb < n_end;) {
+      int rows = std::min(4, n_end - nb);
+      int group_id = nb / 4;
+      uint8_t* dst_group = b_u8 + group_id * 2 * k;
+      for (int g = 0; g < kg_count; g++) {
+        for (int r = 0; r < rows; r++) {
+          std::memcpy(dst_group + g * 64 + r * 16, proj + (nb + r) * row_bytes + g * 16, 16);
+        }
+      }
+      nb += rows;
+    }
   }
 
-  // Get pointer to submatrix for computation
+  // Get pointer to a single row's data at K-group-boundary column.
   dt* get_submat(int n, int k, int n_begin, int k_begin) {
-    const size_t row_bytes = static_cast<size_t>(k) / 2;
-    const size_t row_offset = static_cast<size_t>(n_begin) * row_bytes;
-    const size_t col_offset = static_cast<size_t>(k_begin) / 2;
-    return reinterpret_cast<dt*>(reinterpret_cast<uint8_t*>(b) + row_offset + col_offset);
+    int group_id = n_begin / 4;
+    int row_in_group = n_begin % 4;
+    int kg = k_begin / 32;
+    int byte_within_kg = (k_begin % 32) / 2;  // 0..15 byte in the 16-byte row chunk
+    return reinterpret_cast<dt*>(reinterpret_cast<uint8_t*>(b) + group_id * 2 * k + kg * 64 + row_in_group * 16 +
+                                 byte_within_kg);
+  }
+
+  // Get pointer to 4-row group data (64 bytes) at K-group boundary.
+  // n_begin must be 4-aligned. Returns address of 64 contiguous bytes:
+  //   [row_r..row_r+3] × K-group kg.
+  void* get_submat_4row(int n, int k, int n_begin, int k_begin) {
+    int group_id = n_begin / 4;
+    int kg = k_begin / 32;
+    return reinterpret_cast<uint8_t*>(b) + group_id * 2 * k + kg * 64;
   }
 
   // Get scale pointer for a specific row and k_group
   float* get_scale(int n, int n_begin, int k, int k_begin) {
     int k_group_idx = k_begin / k_group_size;
     return d + n_begin * (k / k_group_size) + k_group_idx;
+  }
+
+  // Convert interleaved layout back to row-major for GPU transfer
+  void to_raw_mat(uint8_t* dst, int n_rows) const {
+    const size_t row_bytes = static_cast<size_t>(k) / 2;
+    const int kg_count = k / 32;
+    const uint8_t* b_u8 = reinterpret_cast<const uint8_t*>(b);
+    for (int nb = 0; nb < n_rows; nb += 4) {
+      int rows = std::min(4, n_rows - nb);
+      int group_id = nb / 4;
+      const uint8_t* src_group = b_u8 + group_id * 2 * k;
+      for (int g = 0; g < kg_count; g++) {
+        for (int r = 0; r < rows; r++) {
+          std::memcpy(dst + (nb + r) * row_bytes + g * 16, src_group + g * 64 + r * 16, 16);
+        }
+      }
+    }
   }
 
   // Split range for parallel processing
