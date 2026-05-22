@@ -153,6 +153,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   }
 
   // mat-vec: M 个独立 token，N 维 4 行一组累加，摊销 horizontal reduce。
+  // 内层 K 循环展开 2 路，配合软件预取以隐藏 LUT 延迟与 cache miss。
   static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
@@ -164,12 +165,8 @@ struct GemmKernel224MXFP4SmallKGroup {
       __m512bh* a_row = (__m512bh*)ba->get_submat(m, k, m_idx, 0);
 
       int n_pos = n_start;
-      // 主循环: N 维 4 行一组
       for (; n_pos + 4 <= n_end; n_pos += 4) {
-        __m128i* w0 = (__m128i*)bb->get_submat(n, k, n_pos + 0, 0);
-        __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
-        __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
-        __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
+        __m512i* wg_ptr = (__m512i*)bb->get_submat_4row(n, k, n_pos, 0);
         const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
         const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
         const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
@@ -180,12 +177,55 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc2 = _mm512_setzero_ps();
         __m512 acc3 = _mm512_setzero_ps();
 
-        for (int g = 0; g < kg_count; g++) {
+        int g = 0;
+        for (; g + 1 < kg_count; g += 2) {
+          _mm_prefetch((const char*)&wg_ptr[g + 2], _MM_HINT_T0);
+          _mm_prefetch((const char*)&a_row[g + 2], _MM_HINT_T0);
+
+          __m512i wg0 = wg_ptr[g];
+          __m128i w00 = _mm512_castsi512_si128(wg0);
+          __m128i w01 = _mm512_extracti32x4_epi32(wg0, 1);
+          __m128i w02 = _mm512_extracti32x4_epi32(wg0, 2);
+          __m128i w03 = _mm512_extracti32x4_epi32(wg0, 3);
+
+          const ActivationBF16 a0(a_row[g]);
+          const DequantizedWeight d00(w00), d01(w01), d02(w02), d03(w03);
+          const __m512 s00 = _mm512_set1_ps(s0[g]);
+          const __m512 s01 = _mm512_set1_ps(s1[g]);
+          const __m512 s02 = _mm512_set1_ps(s2[g]);
+          const __m512 s03 = _mm512_set1_ps(s3[g]);
+
+          acc0 = _mm512_fmadd_ps(s00, mxfp4_dot_bf16(d00, a0), acc0);
+          acc1 = _mm512_fmadd_ps(s01, mxfp4_dot_bf16(d01, a0), acc1);
+          acc2 = _mm512_fmadd_ps(s02, mxfp4_dot_bf16(d02, a0), acc2);
+          acc3 = _mm512_fmadd_ps(s03, mxfp4_dot_bf16(d03, a0), acc3);
+
+          __m512i wg1 = wg_ptr[g + 1];
+          __m128i w10 = _mm512_castsi512_si128(wg1);
+          __m128i w11 = _mm512_extracti32x4_epi32(wg1, 1);
+          __m128i w12 = _mm512_extracti32x4_epi32(wg1, 2);
+          __m128i w13 = _mm512_extracti32x4_epi32(wg1, 3);
+
+          const ActivationBF16 a1(a_row[g + 1]);
+          const DequantizedWeight d10(w10), d11(w11), d12(w12), d13(w13);
+          const __m512 s10 = _mm512_set1_ps(s0[g + 1]);
+          const __m512 s11 = _mm512_set1_ps(s1[g + 1]);
+          const __m512 s12 = _mm512_set1_ps(s2[g + 1]);
+          const __m512 s13 = _mm512_set1_ps(s3[g + 1]);
+
+          acc0 = _mm512_fmadd_ps(s10, mxfp4_dot_bf16(d10, a1), acc0);
+          acc1 = _mm512_fmadd_ps(s11, mxfp4_dot_bf16(d11, a1), acc1);
+          acc2 = _mm512_fmadd_ps(s12, mxfp4_dot_bf16(d12, a1), acc2);
+          acc3 = _mm512_fmadd_ps(s13, mxfp4_dot_bf16(d13, a1), acc3);
+        }
+        for (; g < kg_count; g++) {
+          __m512i wg = wg_ptr[g];
+          __m128i w0 = _mm512_castsi512_si128(wg);
+          __m128i w1 = _mm512_extracti32x4_epi32(wg, 1);
+          __m128i w2 = _mm512_extracti32x4_epi32(wg, 2);
+          __m128i w3 = _mm512_extracti32x4_epi32(wg, 3);
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
+          const DequantizedWeight d0(w0), d1(w1), d2(w2), d3(w3);
           acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), acc0);
           acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), acc1);
           acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), acc2);
@@ -193,7 +233,6 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
         reduce4(acc0, acc1, acc2, acc3, c_row + (n_pos - n_start));
       }
-      // N 尾巴: N % 4 != 0 时单行 fallback
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
         const float* s = bb->get_scale(n, n_pos, k, 0);
@@ -208,16 +247,16 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  // mat-mat: 4×2 register tile (M_TILE=4, N_TILE=2 → 8 累加器, ≤ 32 ZMM 寄存器,
-  // 避免 Skylake-SP 寄存溢出)。每 K-group 解码 2 行 N, 被 4 个 token 共享。
-  // M / N 尾巴回退到 mat-vec 单 token 内层 (V4 chunked-prefill 16/32/64 整数倍, 极少触发)。
+  // mat-mat: 4×4 register tile (M_TILE=4, N_TILE=4 → 16 累加器)。
+  // 每 K-group 解码 4 行 N 一次, 被 4 个 token 共享 → PSHUFB 解码开销 / 4。
+  // 内层 K 循环使用软件预取隐藏 cache miss 延迟。
   static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
     constexpr int MB = 4;
-    constexpr int NB = 2;
+    constexpr int NB = 4;
 
     int m_pos = 0;
     for (; m_pos + MB <= m; m_pos += MB) {
@@ -230,27 +269,38 @@ struct GemmKernel224MXFP4SmallKGroup {
 
       int n_pos = n_start;
       for (; n_pos + NB <= n_end; n_pos += NB) {
-        __m128i* w0 = (__m128i*)bb->get_submat(n, k, n_pos + 0, 0);
-        __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
+        __m512i* wg_ptr = (__m512i*)bb->get_submat_4row(n, k, n_pos, 0);
         const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
         const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
+        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
+        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
 
         __m512 acc[MB][NB];
         for (int i = 0; i < MB; i++)
           for (int j = 0; j < NB; j++) acc[i][j] = _mm512_setzero_ps();
 
         for (int g = 0; g < kg_count; g++) {
-          // 2 行权重解码一次, MB 个 token 共享
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
+          _mm_prefetch((const char*)&wg_ptr[g + 4], _MM_HINT_T0);
+          _mm_prefetch((const char*)&a_rows[0][g + 2], _MM_HINT_T0);
+
+          __m512i wg = wg_ptr[g];
+          __m128i w0 = _mm512_castsi512_si128(wg);
+          __m128i w1 = _mm512_extracti32x4_epi32(wg, 1);
+          __m128i w2 = _mm512_extracti32x4_epi32(wg, 2);
+          __m128i w3 = _mm512_extracti32x4_epi32(wg, 3);
+          const DequantizedWeight d0(w0), d1(w1), d2(w2), d3(w3);
           const __m512 sv0 = _mm512_set1_ps(s0[g]);
           const __m512 sv1 = _mm512_set1_ps(s1[g]);
+          const __m512 sv2 = _mm512_set1_ps(s2[g]);
+          const __m512 sv3 = _mm512_set1_ps(s3[g]);
 
 #define V_FMA_ROW(M_I)                                                      \
   do {                                                                      \
     const ActivationBF16 a(a_rows[M_I][g]);                                 \
     acc[M_I][0] = _mm512_fmadd_ps(sv0, mxfp4_dot_bf16(d0, a), acc[M_I][0]); \
     acc[M_I][1] = _mm512_fmadd_ps(sv1, mxfp4_dot_bf16(d1, a), acc[M_I][1]); \
+    acc[M_I][2] = _mm512_fmadd_ps(sv2, mxfp4_dot_bf16(d2, a), acc[M_I][2]); \
+    acc[M_I][3] = _mm512_fmadd_ps(sv3, mxfp4_dot_bf16(d3, a), acc[M_I][3]); \
   } while (0)
           V_FMA_ROW(0);
           V_FMA_ROW(1);
@@ -260,11 +310,9 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
         for (int i = 0; i < MB; i++) {
           float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
-          c_row[n_pos - n_start + 0] = _mm512_reduce_add_ps(acc[i][0]);
-          c_row[n_pos - n_start + 1] = _mm512_reduce_add_ps(acc[i][1]);
+          reduce4(acc[i][0], acc[i][1], acc[i][2], acc[i][3], c_row + (n_pos - n_start));
         }
       }
-      // N 尾巴: 单 N 列 × MB token
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
         const float* s = bb->get_scale(n, n_pos, k, 0);
@@ -280,26 +328,31 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
       }
     }
-    // M 尾巴: M 不是 MB 倍数时余下 token, 退回单 token mat-vec 内层
     for (int mi = m_pos; mi < m; mi++) {
       float* c_row = bc->get_submat(m, n, mi, n_start);
       __m512bh* a_row = (__m512bh*)ba->get_submat(m, k, mi, 0);
       int n_pos = n_start;
-      for (; n_pos + 2 <= n_end; n_pos += 2) {
-        __m128i* w0 = (__m128i*)bb->get_submat(n, k, n_pos + 0, 0);
-        __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
+      for (; n_pos + 4 <= n_end; n_pos += 4) {
+        __m512i* wg_ptr = (__m512i*)bb->get_submat_4row(n, k, n_pos, 0);
         const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
         const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
+        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
+          __m512i wg = wg_ptr[g];
+          __m128i w0 = _mm512_castsi512_si128(wg);
+          __m128i w1 = _mm512_extracti32x4_epi32(wg, 1);
+          __m128i w2 = _mm512_extracti32x4_epi32(wg, 2);
+          __m128i w3 = _mm512_extracti32x4_epi32(wg, 3);
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
+          const DequantizedWeight d0(w0), d1(w1), d2(w2), d3(w3);
           a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), a0);
           a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), a1);
+          a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), a2);
+          a3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]), mxfp4_dot_bf16(d3, a), a3);
         }
-        c_row[n_pos - n_start + 0] = _mm512_reduce_add_ps(a0);
-        c_row[n_pos - n_start + 1] = _mm512_reduce_add_ps(a1);
+        reduce4(a0, a1, a2, a3, c_row + (n_pos - n_start));
       }
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
@@ -481,6 +534,30 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (bytes -= chunks * 64) std::memcpy(d, s, bytes);
   }
 
+  // Copy byte range [start, end) from 4-row-interleaved weight buffer to
+  // row-major destination.  Copies at most 16 bytes per iteration (one
+  // K-group's worth for one row) to correctly de-interleave at K-group
+  // granularity.  dst must point to where byte-logical-offset=start lives
+  // in the output (i.e. the caller passes dst = row_major_base + start).
+  static inline void deinterleave_weight_copy(uint8_t* __restrict dst, const uint8_t* __restrict src, int k,
+                                              size_t start, size_t end) {
+    const size_t row_bytes = k / 2;
+    for (size_t pos = start; pos < end;) {
+      size_t row = pos / row_bytes;
+      int group_id = row / 4;
+      int r_in_group = row % 4;
+      size_t off_in_row = pos % row_bytes;
+      int kg = off_in_row / 16;
+      int byte_in_kg = off_in_row % 16;
+      size_t kg_rem = 16 - byte_in_kg;
+      size_t row_rem = row_bytes - off_in_row;
+      size_t to_copy = std::min(end - pos, std::min(kg_rem, row_rem));
+      const uint8_t* s = src + group_id * 2 * k + kg * 64 + r_in_group * 16 + byte_in_kg;
+      memcpy(dst + (pos - start), s, to_copy);
+      pos += to_copy;
+    }
+  }
+
   static inline void fast_fp32_to_bf16(ggml_bf16_t* __restrict dst, const float* __restrict src, size_t count) {
     size_t i = 0;
     for (; i + 32 <= count; i += 32) {
@@ -542,15 +619,15 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t start = chunk_idx * weight_chunk_size;
               size_t end = std::min(start + weight_chunk_size, cpu_tp_weight_bytes);
               if (start < end)
-                fast_memcpy(w13_weight_dst + offset_in_gpu_weight + start, (uint8_t*)gate_bb_[expert_id]->b + start,
-                            end - start);
+                deinterleave_weight_copy(w13_weight_dst + offset_in_gpu_weight + start,
+                                         (uint8_t*)gate_bb_[expert_id]->b, config_.hidden_size, start, end);
             } else if (task_id < NUM_WEIGHT_TASKS * 2) {
               int chunk_idx = task_id - NUM_WEIGHT_TASKS;
               size_t start = chunk_idx * weight_chunk_size;
               size_t end = std::min(start + weight_chunk_size, cpu_tp_weight_bytes);
               if (start < end)
-                fast_memcpy(w13_weight_dst + offset_in_gpu_weight + gpu_tp_weight_bytes + start,
-                            (uint8_t*)up_bb_[expert_id]->b + start, end - start);
+                deinterleave_weight_copy(w13_weight_dst + offset_in_gpu_weight + gpu_tp_weight_bytes + start,
+                                         (uint8_t*)up_bb_[expert_id]->b, config_.hidden_size, start, end);
             } else if (task_id < NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
               int chunk_idx = task_id - NUM_WEIGHT_TASKS * 2;
               size_t cols_per_chunk = (config_.hidden_size + num_down_tasks - 1) / num_down_tasks;
@@ -565,8 +642,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t gpu_scale_slice_offset = local_idx * scale_per_col;
 
               for (size_t col = col_start; col < col_end; col++) {
-                fast_memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
-                            (uint8_t*)down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
+                deinterleave_weight_copy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
+                                         (uint8_t*)down_bb_[expert_id]->b, config_.intermediate_size,
+                                         col * weight_per_col, (col + 1) * weight_per_col);
                 fast_fp32_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
                                   down_bb_[expert_id]->d + col * scale_per_col, scale_per_col);
               }
@@ -617,15 +695,15 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               size_t start = chunk_idx * weight_chunk_size;
               size_t end = std::min(start + weight_chunk_size, data_per_gpu_tp_weight);
               if (start < end)
-                fast_memcpy(w13_weight_dst + start, (uint8_t*)gate_bb_[expert_id]->b + cpu_offset_weight + start,
-                            end - start);
+                deinterleave_weight_copy(w13_weight_dst + start, (uint8_t*)gate_bb_[expert_id]->b, config_.hidden_size,
+                                         cpu_offset_weight + start, cpu_offset_weight + end);
             } else if (task_type < NUM_WEIGHT_TASKS * 2) {
               int chunk_idx = task_type - NUM_WEIGHT_TASKS;
               size_t start = chunk_idx * weight_chunk_size;
               size_t end = std::min(start + weight_chunk_size, data_per_gpu_tp_weight);
               if (start < end)
-                fast_memcpy(w13_weight_dst + gpu_tp_weight_bytes + start,
-                            (uint8_t*)up_bb_[expert_id]->b + cpu_offset_weight + start, end - start);
+                deinterleave_weight_copy(w13_weight_dst + gpu_tp_weight_bytes + start, (uint8_t*)up_bb_[expert_id]->b,
+                                         config_.hidden_size, cpu_offset_weight + start, cpu_offset_weight + end);
             } else if (task_type < NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
               int chunk_idx = task_type - NUM_WEIGHT_TASKS * 2;
               size_t cols_per_chunk = (config_.hidden_size + num_down_tasks - 1) / num_down_tasks;
@@ -641,8 +719,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                 size_t col_offset_scale = (col * (config_.intermediate_size / group_size)) +
                                           (local_gpu_idx * data_per_gpu_tp_scale / config_.hidden_size);
 
-                fast_memcpy(w2_weight_dst + col * weight_per_gpu_col,
-                            (uint8_t*)down_bb_[expert_id]->b + col_offset_weight, weight_per_gpu_col);
+                deinterleave_weight_copy(w2_weight_dst + col * weight_per_gpu_col, (uint8_t*)down_bb_[expert_id]->b,
+                                         config_.intermediate_size, col_offset_weight,
+                                         col_offset_weight + weight_per_gpu_col);
                 fast_fp32_to_bf16(w2_scale_dst + col * scale_per_gpu_col, down_bb_[expert_id]->d + col_offset_scale,
                                   scale_per_gpu_col);
               }
