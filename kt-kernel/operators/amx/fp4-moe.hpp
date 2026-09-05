@@ -53,7 +53,6 @@ struct GemmKernel224MXFP4SmallKGroup {
       0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,   //  0..7  positive
       0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};  //  8..15 negative
 
-#if defined(__AVX512BF16__)
   // Natural lane-local order emitted by the grouped decoder below. Keeping
   // decoded values in this order removes per-output-row 16-bit interleaves;
   // the much smaller activation is permuted once before the N-row loop.
@@ -62,7 +61,8 @@ struct GemmKernel224MXFP4SmallKGroup {
                                                                      13, 15, 17, 19, 21, 23, 25, 27, 29, 31};
   alignas(32) static constexpr uint16_t fp4_bf16[16] = {0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
                                                         0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0};
-#endif
+  alignas(64) static constexpr float fp4_lut_ps[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                                       -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
   // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
   // Output column order: [BF16(lo[0]),BF16(hi[0]), ..., BF16(lo[15]),BF16(hi[15])]
@@ -97,7 +97,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     return _mm512_inserti64x4(_mm512_castsi256_si512(q0), q1, 1);
   }
 
-#if defined(__AVX512BF16__)
   // Decode one complete 32-value group with a word-indexed LUT. Expanding the
   // low/high nibbles directly to word indices avoids the byte lookups and
   // byte-to-word unpack chain used by the PSHUFB decoder. Two independent
@@ -117,7 +116,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512i indices = _mm512_load_si512(static_cast<const void*>(natural_group_indices));
     return (__m512bh)_mm512_permutexvar_epi16(indices, (__m512i)activation);
   }
-#endif
 
   struct ActivationBF16 {
     __m512bh a;
@@ -198,7 +196,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
 
     void from_mat_natural(int m, ggml_bf16_t* src, int ith, int nth) {
-#if defined(__AVX512BF16__)
       assert(m <= max_m);
       assert(ith == 0 && nth == 1);
       assert(k % 32 == 0);
@@ -208,9 +205,6 @@ struct GemmKernel224MXFP4SmallKGroup {
         for (int g = 0; g < k / 32; ++g) dst_row[g] = permute_activation_group(src_row[g]);
       }
       natural_order = true;
-#else
-      from_mat(m, src, ith, nth);
-#endif
     }
   };
 
@@ -369,7 +363,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-#if defined(__AVX512BF16__)
   // Convert a logical BF16 activation into the grouped decoder's natural
   // order. This is intentionally separate from the GEMV so callers can hoist
   // it out of every N-row worker task.
@@ -400,7 +393,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  // m=1/group32 decode fast path. BufferA must already be in natural order.
+#if defined(__AVX512BF16__)
+  // m=1/group32 decode fast path for AVX512BF16. BufferA must already be in natural order.
   template <bool E8_SCALE>
   static void fp4_mat_vec_kgroup_natural_impl(int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
@@ -514,16 +508,183 @@ struct GemmKernel224MXFP4SmallKGroup {
       output[ni - n_start] = _mm512_reduce_add_ps(acc);
     }
   }
+#else
+  // m=1/group32 decode fast path for AVX512F. BufferA must already be in natural order.
+  template <bool E8_SCALE>
+  static void fp4_mat_vec_kgroup_natural_avx512f_impl(int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    const int group_count = k / 32;
+    assert(group_count <= K_BLOCK / 32);
+
+    alignas(64) float act_ps[K_BLOCK / 32][32];
+    const __m512i* activation = reinterpret_cast<const __m512i*>(ba->get_submat(1, k, 0, 0));
+    for (int g = 0; g < group_count; ++g) {
+      const __m512i a = activation[g];
+      const __m256i a_lo = _mm512_castsi512_si256(a);
+      const __m256i a_hi = _mm512_extracti64x4_epi64(a, 1);
+      const __m512 f_lo = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a_lo), 16));
+      const __m512 f_hi = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a_hi), 16));
+      _mm512_store_ps(act_ps[g], f_lo);
+      _mm512_store_ps(act_ps[g] + 16, f_hi);
+    }
+
+    float* output = bc->get_submat(1, n, 0, n_start);
+    alignas(64) float scale_scratch[4][K_BLOCK / 32];
+    const __m512 lut_ps = _mm512_load_ps(fp4_lut_ps);
+    const __m128i lo_mask = _mm_set1_epi8(0x0F);
+
+    int ni = n_start;
+    for (; ni + 4 <= n_end; ni += 4) {
+      const __m128i* w0 = reinterpret_cast<const __m128i*>(bb->get_submat(n, k, ni + 0, 0));
+      const __m128i* w1 = reinterpret_cast<const __m128i*>(bb->get_submat(n, k, ni + 1, 0));
+      const __m128i* w2 = reinterpret_cast<const __m128i*>(bb->get_submat(n, k, ni + 2, 0));
+      const __m128i* w3 = reinterpret_cast<const __m128i*>(bb->get_submat(n, k, ni + 3, 0));
+      const float* s0;
+      const float* s1;
+      const float* s2;
+      const float* s3;
+      if constexpr (E8_SCALE) {
+        expand_e8_scales(bb->get_scale_e8(n, ni + 0, k, 0), scale_scratch[0], group_count);
+        expand_e8_scales(bb->get_scale_e8(n, ni + 1, k, 0), scale_scratch[1], group_count);
+        expand_e8_scales(bb->get_scale_e8(n, ni + 2, k, 0), scale_scratch[2], group_count);
+        expand_e8_scales(bb->get_scale_e8(n, ni + 3, k, 0), scale_scratch[3], group_count);
+        s0 = scale_scratch[0];
+        s1 = scale_scratch[1];
+        s2 = scale_scratch[2];
+        s3 = scale_scratch[3];
+      } else {
+        s0 = bb->get_scale(n, ni + 0, k, 0);
+        s1 = bb->get_scale(n, ni + 1, k, 0);
+        s2 = bb->get_scale(n, ni + 2, k, 0);
+        s3 = bb->get_scale(n, ni + 3, k, 0);
+      }
+      __m512 acc0 = _mm512_setzero_ps();
+      __m512 acc1 = _mm512_setzero_ps();
+      __m512 acc2 = _mm512_setzero_ps();
+      __m512 acc3 = _mm512_setzero_ps();
+
+      auto accumulate_group = [&](int g) __attribute__((always_inline)) {
+        const __m512 a_lo = _mm512_load_ps(act_ps[g]);
+        const __m512 a_hi = _mm512_load_ps(act_ps[g] + 16);
+
+        const __m128i raw0 = w0[g];
+        const __m128i lo0 = _mm_and_si128(raw0, lo_mask);
+        const __m128i hi0 = _mm_and_si128(_mm_srli_epi16(raw0, 4), lo_mask);
+        const __m512 w0_lo = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(lo0), lut_ps);
+        const __m512 w0_hi = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(hi0), lut_ps);
+        const __m512 dot0 = _mm512_fmadd_ps(w0_lo, a_lo, _mm512_mul_ps(w0_hi, a_hi));
+        acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), dot0, acc0);
+
+        const __m128i raw1 = w1[g];
+        const __m128i lo1 = _mm_and_si128(raw1, lo_mask);
+        const __m128i hi1 = _mm_and_si128(_mm_srli_epi16(raw1, 4), lo_mask);
+        const __m512 w1_lo = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(lo1), lut_ps);
+        const __m512 w1_hi = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(hi1), lut_ps);
+        const __m512 dot1 = _mm512_fmadd_ps(w1_lo, a_lo, _mm512_mul_ps(w1_hi, a_hi));
+        acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), dot1, acc1);
+
+        const __m128i raw2 = w2[g];
+        const __m128i lo2 = _mm_and_si128(raw2, lo_mask);
+        const __m128i hi2 = _mm_and_si128(_mm_srli_epi16(raw2, 4), lo_mask);
+        const __m512 w2_lo = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(lo2), lut_ps);
+        const __m512 w2_hi = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(hi2), lut_ps);
+        const __m512 dot2 = _mm512_fmadd_ps(w2_lo, a_lo, _mm512_mul_ps(w2_hi, a_hi));
+        acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), dot2, acc2);
+
+        const __m128i raw3 = w3[g];
+        const __m128i lo3 = _mm_and_si128(raw3, lo_mask);
+        const __m128i hi3 = _mm_and_si128(_mm_srli_epi16(raw3, 4), lo_mask);
+        const __m512 w3_lo = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(lo3), lut_ps);
+        const __m512 w3_hi = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(hi3), lut_ps);
+        const __m512 dot3 = _mm512_fmadd_ps(w3_lo, a_lo, _mm512_mul_ps(w3_hi, a_hi));
+        acc3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]), dot3, acc3);
+      };
+
+      auto prefetch_group = [&](int g) __attribute__((always_inline)) {
+        constexpr int prefetch_groups = 40;
+        const int future = g + prefetch_groups;
+        if (future < group_count) {
+          _mm_prefetch(reinterpret_cast<const char*>(w0 + future), _MM_HINT_T0);
+          _mm_prefetch(reinterpret_cast<const char*>(w1 + future), _MM_HINT_T0);
+          _mm_prefetch(reinterpret_cast<const char*>(w2 + future), _MM_HINT_T0);
+          _mm_prefetch(reinterpret_cast<const char*>(w3 + future), _MM_HINT_T0);
+        }
+      };
+
+      int g = 0;
+      for (; g + 3 < group_count; g += 4) {
+        prefetch_group(g);
+        accumulate_group(g);
+        accumulate_group(g + 1);
+        accumulate_group(g + 2);
+        accumulate_group(g + 3);
+      }
+      for (; g < group_count; ++g) {
+        prefetch_group(g);
+        accumulate_group(g);
+      }
+      reduce4(acc0, acc1, acc2, acc3, output + (ni - n_start));
+    }
+
+    for (; ni < n_end; ++ni) {
+      const __m128i* w = reinterpret_cast<const __m128i*>(bb->get_submat(n, k, ni, 0));
+      const float* scales;
+      if constexpr (E8_SCALE) {
+        expand_e8_scales(bb->get_scale_e8(n, ni, k, 0), scale_scratch[0], group_count);
+        scales = scale_scratch[0];
+      } else {
+        scales = bb->get_scale(n, ni, k, 0);
+      }
+      __m512 acc = _mm512_setzero_ps();
+      auto accumulate_group = [&](int g) __attribute__((always_inline)) {
+        const __m512 a_lo = _mm512_load_ps(act_ps[g]);
+        const __m512 a_hi = _mm512_load_ps(act_ps[g] + 16);
+        const __m128i raw = w[g];
+        const __m128i lo = _mm_and_si128(raw, lo_mask);
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lo_mask);
+        const __m512 w_lo = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(lo), lut_ps);
+        const __m512 w_hi = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(hi), lut_ps);
+        const __m512 dot = _mm512_fmadd_ps(w_lo, a_lo, _mm512_mul_ps(w_hi, a_hi));
+        acc = _mm512_fmadd_ps(_mm512_set1_ps(scales[g]), dot, acc);
+      };
+      auto prefetch_group = [&](int g) __attribute__((always_inline)) {
+        constexpr int prefetch_groups = 40;
+        const int future = g + prefetch_groups;
+        if (future < group_count) _mm_prefetch(reinterpret_cast<const char*>(w + future), _MM_HINT_T0);
+      };
+      int g = 0;
+      for (; g + 3 < group_count; g += 4) {
+        prefetch_group(g);
+        accumulate_group(g);
+        accumulate_group(g + 1);
+        accumulate_group(g + 2);
+        accumulate_group(g + 3);
+      }
+      for (; g < group_count; ++g) {
+        prefetch_group(g);
+        accumulate_group(g);
+      }
+      output[ni - n_start] = _mm512_reduce_add_ps(acc);
+    }
+  }
+#endif
 
   static void fp4_mat_vec_kgroup_natural(int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
+#if defined(__AVX512BF16__)
     if (bb->scale_e8_valid) {
       fp4_mat_vec_kgroup_natural_impl<true>(n, k, ba, bb, bc, ith, nth);
     } else {
       fp4_mat_vec_kgroup_natural_impl<false>(n, k, ba, bb, bc, ith, nth);
     }
-  }
-
+#else
+    if (bb->scale_e8_valid) {
+      fp4_mat_vec_kgroup_natural_avx512f_impl<true>(n, k, ba, bb, bc, ith, nth);
+    } else {
+      fp4_mat_vec_kgroup_natural_avx512f_impl<false>(n, k, ba, bb, bc, ith, nth);
+    }
 #endif
+  }
 
   // mat-mat: 4×4 register tile (M_TILE=4, N_TILE=4 → 16 累加器)。
   // 每 K-group 解码 4 行 N 一次, 被 4 个 token 共享 → PSHUFB 解码开销 / 4。
@@ -654,12 +815,10 @@ inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferA> ba,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferB> bb,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc, int ith, int nth) {
-#if defined(__AVX512BF16__)
   if (m == 1 && k_group_size == 32 && k % 32 == 0 && ba->natural_order) {
     GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup_natural(n, k, ba.get(), bb.get(), bc.get(), ith, nth);
     return;
   }
-#endif
   GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 
@@ -769,7 +928,6 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   }
 
   void apply_decode_activation(int activated_expert, int nth, int qlen) {
-#if defined(__AVX512BF16__)
     if (qlen != 1 || config_.quant_config.group_size != 32 || config_.intermediate_size % 32 != 0) {
       Base::apply_decode_activation(activated_expert, nth, qlen);
       return;
@@ -785,17 +943,20 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         __m512 gate0, gate1, up0, up1;
         avx512_32xbf16_to_32xfp32((__m512i*)(gate + j), &gate0, &gate1);
         avx512_32xbf16_to_32xfp32((__m512i*)(up + j), &up0, &up1);
-        const __m512 result0 = amx::act_fn(gate0, up0, config_.swiglu_limit, config_.swiglu_alpha);
-        const __m512 result1 = amx::act_fn(gate1, up1, config_.swiglu_limit, config_.swiglu_alpha);
+        __m512 result0 = amx::act_fn(gate0, up0, config_.swiglu_limit, config_.swiglu_alpha);
+        __m512 result1 = amx::act_fn(gate1, up1, config_.swiglu_limit, config_.swiglu_alpha);
+#if defined(__AVX512BF16__)
         const __m512bh logical = _mm512_cvtne2ps_pbh(result1, result0);
+#else
+        __m512i logical_i;
+        avx512_32xfp32_to_32xbf16(&result0, &result1, &logical_i);
+        const __m512bh logical = (__m512bh)logical_i;
+#endif
         const __m512bh natural = T::permute_activation_group(logical);
         _mm512_storeu_si512((void*)(destination + (j - n_start)), (__m512i)natural);
       }
       down_ba_[expert_idx]->natural_order = true;
     }
-#else
-    Base::apply_decode_activation(activated_expert, nth, qlen);
-#endif
   }
 
   void load_weights() {
